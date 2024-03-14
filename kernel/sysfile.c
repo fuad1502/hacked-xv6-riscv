@@ -66,6 +66,7 @@ sys_dup(void)
 }
 
 extern int read_count;
+extern struct spinlock read_count_lock;
 
 uint64
 sys_read(void)
@@ -74,7 +75,9 @@ sys_read(void)
   int n;
   uint64 p;
 
+  acquire(&read_count_lock);
   read_count += 1;
+  release(&read_count_lock);
 
   argaddr(1, &p);
   argint(2, &n);
