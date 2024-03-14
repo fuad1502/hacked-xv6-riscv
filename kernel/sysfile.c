@@ -65,12 +65,16 @@ sys_dup(void)
   return fd;
 }
 
+extern int read_count;
+
 uint64
 sys_read(void)
 {
   struct file *f;
   int n;
   uint64 p;
+
+  read_count += 1;
 
   argaddr(1, &p);
   argint(2, &n);
