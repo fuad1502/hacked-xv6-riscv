@@ -17,3 +17,5 @@ user/usys.S
 .gdbinit
 .cache
 compile_commands.json
+Makefile.test
+user/test_*.c
