@@ -135,7 +135,6 @@ UPROGS=\
 	$U/_wc\
 	$U/_zombie\
 	$U/_hack\
-	$U/_hack_scheduler\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
