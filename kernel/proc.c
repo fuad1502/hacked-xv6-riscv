@@ -519,18 +519,20 @@ int settickets(int number) {
   acquire(&p->lock);
   int old_tickets = p->tickets;
   p->tickets = number;
+  if (p->state == RUNNABLE) {
+    acquire(&total_tickets_lock);
+    total_tickets -= old_tickets;
+    total_tickets += number;
+    release(&total_tickets_lock);
+  }
   release(&p->lock);
-
-  acquire(&total_tickets_lock);
-  total_tickets -= old_tickets;
-  total_tickets += number;
-  release(&total_tickets_lock);
 
   return 0;
 }
 
 int getpinfo(struct pstat *p) {
   struct pstat stat;
+  printf("total tickets = %d\n", total_tickets);
   for (int i = 0; i < NPROC; i++) {
     struct proc *process = &proc[i];
     acquire(&process->lock);
