@@ -5,6 +5,8 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "random.h"
+#include "pstat.h"
 
 struct cpu cpus[NCPU];
 
@@ -15,8 +17,13 @@ struct proc *initproc;
 int nextpid = 1;
 struct spinlock pid_lock;
 
+int total_tickets = 0;
+struct spinlock total_tickets_lock;
+
 extern void forkret(void);
 static void freeproc(struct proc *p);
+static struct proc *get_proc_to_run();
+static void setprocstate(struct proc* p, enum procstate state);
 
 extern char trampoline[]; // trampoline.S
 
@@ -124,6 +131,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->tickets = 1;
+  p->ticks = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -168,7 +177,9 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
-  p->state = UNUSED;
+  setprocstate(p, UNUSED);
+  p->tickets = 0;
+  p->ticks = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -249,7 +260,7 @@ userinit(void)
   safestrcpy(p->name, "initcode", sizeof(p->name));
   p->cwd = namei("/");
 
-  p->state = RUNNABLE;
+  setprocstate(p, RUNNABLE);
 
   release(&p->lock);
 }
@@ -318,8 +329,13 @@ fork(void)
   np->parent = p;
   release(&wait_lock);
 
+  acquire(&p->lock);
+  int p_tickets = p->tickets;
+  release(&p->lock);
+
   acquire(&np->lock);
-  np->state = RUNNABLE;
+  np->tickets = p_tickets;
+  setprocstate(np, RUNNABLE);
   release(&np->lock);
 
   return pid;
@@ -376,7 +392,7 @@ exit(int status)
   acquire(&p->lock);
 
   p->xstate = status;
-  p->state = ZOMBIE;
+  setprocstate(p, ZOMBIE);
 
   release(&wait_lock);
 
@@ -452,23 +468,101 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+    p = get_proc_to_run();
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-      }
+    if(p) {
+      // Switch to chosen process.  It is the process's job
+      // to release its lock and then reacquire it
+      // before jumping back to us.
+      setprocstate(p, RUNNING);
+      c->proc = p;
+      p->ticks += 1;
+
+      swtch(&c->context, &p->context);
+
+      // Process is done running for now.
+      // It should have changed its p->state before coming back.
+      c->proc = 0;
       release(&p->lock);
     }
   }
+}
+
+// Get process to run based on the lottery scheduling policy.
+struct proc *get_proc_to_run() {
+  struct proc *p;
+  int lottery = get_random_int(total_tickets);
+  int tickets_accumulation = 0;
+  int has_selected_proc = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == RUNNABLE) {
+      tickets_accumulation += p->tickets;
+      if (tickets_accumulation > lottery) {
+        has_selected_proc = 1;
+        break;
+      }
+    }
+    release(&p->lock);
+  }
+
+  if (has_selected_proc) {
+    return p;
+  }
+  return 0;
+}
+
+int settickets(int number) {
+  struct proc *p = myproc();
+
+  acquire(&p->lock);
+  int old_tickets = p->tickets;
+  p->tickets = number;
+  release(&p->lock);
+
+  acquire(&total_tickets_lock);
+  total_tickets -= old_tickets;
+  total_tickets += number;
+  release(&total_tickets_lock);
+
+  return 0;
+}
+
+int getpinfo(struct pstat *p) {
+  struct pstat stat;
+  for (int i = 0; i < NPROC; i++) {
+    struct proc *process = &proc[i];
+    acquire(&process->lock);
+    if (process->state != UNUSED) {
+      stat.inuse[i] = 1;
+      stat.pid[i] = process->pid;
+      stat.tickets[i] = process->tickets;
+      stat.ticks[i] = process->ticks;
+    } else {
+      stat.inuse[i] = 0;
+    }
+    release(&process->lock);
+  }
+
+  struct proc *process = myproc();
+  acquire(&process->lock);
+  copyout(process->pagetable, (uint64)p, (char *)&stat, sizeof(struct pstat));
+  release(&process->lock);
+
+  return 0;
+}
+
+// Sets process state and update total_tickets if the state changes from or into
+// RUNNABLE. p->lock must be acquired first.
+void setprocstate(struct proc* p, enum procstate state) {
+  enum procstate old_state = p->state;
+  p->state = state;
+  acquire(&total_tickets_lock);
+  total_tickets += (old_state != state && state == RUNNABLE) ? p->tickets : 0;
+  total_tickets -=
+      (old_state != state && old_state == RUNNABLE) ? p->tickets : 0;
+  release(&total_tickets_lock);
 }
 
 // Switch to scheduler.  Must hold only p->lock
@@ -504,7 +598,7 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
-  p->state = RUNNABLE;
+  setprocstate(p, RUNNABLE);
   sched();
   release(&p->lock);
 }
@@ -549,7 +643,7 @@ sleep(void *chan, struct spinlock *lk)
 
   // Go to sleep.
   p->chan = chan;
-  p->state = SLEEPING;
+  setprocstate(p, SLEEPING);
 
   sched();
 
@@ -572,7 +666,7 @@ wakeup(void *chan)
     if(p != myproc()){
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
-        p->state = RUNNABLE;
+        setprocstate(p, RUNNABLE);
       }
       release(&p->lock);
     }
@@ -593,7 +687,7 @@ kill(int pid)
       p->killed = 1;
       if(p->state == SLEEPING){
         // Wake process from sleep().
-        p->state = RUNNABLE;
+        setprocstate(p, RUNNABLE);
       }
       release(&p->lock);
       return 0;
